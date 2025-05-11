@@ -1,7 +1,6 @@
 """FlwrNew: A Flower / TensorFlow app."""
 
 import os
-
 import keras
 from keras import layers
 from flwr_datasets import FederatedDataset

@@ -1,8 +1,9 @@
-import base64
 import json
+import random
 from typing import Dict, List, Optional, Tuple, Union
 import os
 import numpy as np
+import time
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Random import get_random_bytes
@@ -21,10 +22,10 @@ from flwr.common import (
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import Strategy
-from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg
+from flwr.server.strategy.aggregate import weighted_loss_avg
 from flwr.server.history import History
 from flwrnew.task import load_model
-from flwrnew.aggregate_send import send_weights_to_server
+from flwrnew.aggregate_send import send_weights_to_server, request_data_usage_from_agg_server
 
 # Get current date and time for use in filenames
 date_today_raw = datetime.now()
@@ -42,9 +43,17 @@ with open(public_key_path, "rb") as pub_file:
     public_key = RSA.import_key(pub_file.read())
 
 
+def encrypt_cl_srv_comms(data: bytes, public_key: RSA.RsaKey) -> bytes:
+    cipher = PKCS1_OAEP.new(public_key)
+    return cipher.encrypt(data)
+
+
 # Utility functions for encryption and decryption
 def encrypt_with_rsa(data: bytes) -> bytes:
     """Encrypt data using RSA hybrid encryption."""
+    # Timing the ecryption time
+    start_time = time.time()
+
     # Generate a random symmetric key for AES encryption
     symmetric_key = get_random_bytes(16)
 
@@ -59,18 +68,19 @@ def encrypt_with_rsa(data: bytes) -> bytes:
     # Combine encrypted key, AES nonce, ciphertext, and tag
     encrypted_message = encrypted_key + aes_cipher.nonce + ciphertext + tag
 
-    # Log lengths for debugging
-    print(f"RSA Encrypted Key Length: {len(encrypted_key)}")
-    print(f"AES Nonce Length: {len(aes_cipher.nonce)}")
-    print(f"AES Ciphertext Length: {len(ciphertext)}")
-    print(f"AES Tag Length: {len(tag)}")
-    print(f"Total Encrypted Message Length: {len(encrypted_message)}")
+    end_time = time.time()
+    enc_time = round(end_time - start_time, 4)
+    print(f"Encryption took {enc_time} sec.")
+    log_time("Encryption", enc_time)
 
     return encrypted_message
 
 
 def decrypt_with_rsa(encrypted_message: bytes) -> bytes:
     """Decrypt data using RSA hybrid encryption."""
+    # Timing the decryption time
+    start_time = time.time()
+
     # Validate the minimum length of the encrypted message
     if len(encrypted_message) < 256 + 16 + 16:
         raise ValueError(f"Invalid encrypted message length: {len(encrypted_message)}")
@@ -88,15 +98,41 @@ def decrypt_with_rsa(encrypted_message: bytes) -> bytes:
     ciphertext = encrypted_data[16:-16]
     tag = encrypted_data[-16:]
 
-    # Log lengths for debugging
-    print(f"Nonce Length: {len(nonce)}")
-    print(f"Ciphertext Length: {len(ciphertext)}")
-    print(f"Tag Length: {len(tag)}")
-
     # Decrypt the data using AES
     aes_cipher = AES.new(symmetric_key, AES.MODE_EAX, nonce=nonce)
     plaintext = aes_cipher.decrypt_and_verify(ciphertext, tag)
+
+    end_time = time.time()
+    dec_time = round(end_time - start_time, 4)
+    print(f"Decryption took {dec_time} sec.")
+    log_time("Decryption", dec_time)
+
     return plaintext
+
+
+def log_time(action: str, duration: float):
+    """Logging timed processes within custom strategy"""
+    log_entry = {
+        "action": action,
+        "duration_sec": duration,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    file = "history/timing_log.json"
+    if os.path.exists(file):
+        with open(file, "r") as f:
+            try:
+                logs = json.load(f)
+            except json.JSONDecodeError:
+                logs = []
+    else:
+        logs = []
+
+    logs.append(log_entry)
+
+    with open(file, "w") as f1:
+        json.dump(logs, f1, indent=4)
+
+    print(f"Logged time for {action}")
 
 
 # Simple class to hold the global model and return weights
@@ -140,6 +176,8 @@ class FedCustom(Strategy):
         self.save_dir = save_dir  # Directory to save models
         self.history = history  # Flower history object to track results
         self.history_dir = history_dir  # Directory to save history
+        self.client_public_keys = {}
+        self.data_usage_clients = []  # Array for client ids for requests of data usage
 
         # Create the directory to save models if it does not exist
         if not os.path.exists(self.save_dir):
@@ -167,52 +205,81 @@ class FedCustom(Strategy):
         # Convert NumPy arrays to Flower Parameters format
         return ndarrays_to_parameters(ndarrays)
 
+    def aggregate_client_weights(self, client_weights, num_examples):
+        """Client-side aggregation of model weights using weighted average."""
+        aggregated_weights = []
+
+        # Calculate total number of examples across all clients
+        total_examples = sum(num_examples)
+
+        # Loop through each layer of the model
+        for layer_idx in range(len(client_weights[0])):  # Assuming all clients have the same number of layers
+            # Initialize the weighted sum for this layer
+            weighted_sum = np.zeros_like(client_weights[0][layer_idx])
+
+            # Sum the weighted layers for each client
+            for weights, num_example in zip(client_weights, num_examples):
+                weighted_sum += weights[layer_idx] * num_example  # Weighted sum of layer weights
+
+            # Normalize by the total number of examples to get the weighted average
+            aggregated_weights.append(weighted_sum / total_examples)
+
+        return aggregated_weights
+
     def serialize_parameters(self, params):
         """Serialize model parameters."""
-        return json.dumps([w.tolist() if isinstance(w, np.ndarray) else [w] for w in params]).encode("utf-8")
+        return json.dumps([p.tolist() if isinstance(p, np.ndarray) else p for p in params]).encode("utf-8")
+
+    def serialize_client_update(self, client_update):
+        """Serialize list of (weights, num_examples) tuples."""
+        serializable = []
+        for weights, num_examples in client_update:
+            serializable.append({
+                "weights": [w.tolist() for w in weights],
+                "num_examples": num_examples
+            })
+        return json.dumps(serializable).encode("utf-8")
 
     def deserialize_parameters(self, params_bytes):
         """Deserialize model parameters."""
         print("Deserialization going on")
         return [np.array(w) for w in json.loads(params_bytes.decode("utf-8"))]
 
-    def configure_fit(
-            self, server_round: int, parameters: Parameters, client_manager: ClientManager
-    ) -> List[Tuple[ClientProxy, FitIns]]:
-        """Configure the next round of training."""
+    def request_client_keys(self, clients):
+        """Request public keys from the selected clients."""
+        print("Requesting all client keys - start")
+        for client in clients:
+            # Hypothetical RPC call to the client to get its public key
+            client_public_key = client.get_public_key()
+            self.client_public_keys[client.cid] = client_public_key
+            print("Requesting all client keys - end")
 
-        # Convert Parameters object to NumPy arrays for inspection
+    def configure_fit(self, server_round: int, parameters: Parameters, client_manager: ClientManager) -> List[
+        Tuple[ClientProxy, FitIns]]:
+        # Timer for measuring the configuration training time
+        start_time = time.time()
+
         param_arrays = parameters_to_ndarrays(parameters)
+        sample_size, min_num_clients = self.num_fit_clients(client_manager.num_available())
+        clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num_clients)
 
-        # Ensure keys are initialized for each run
-        if self.server_key_pair is None:
-            self.initialize_keys()
-
-        # Sample clients based on the available number of clients
-        sample_size, min_num_clients = self.num_fit_clients(
-            client_manager.num_available()
-        )
-        clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
-        )
-
-        # Configure clients with different learning rates for experimentation
-        n_clients = len(clients)
-        half_clients = n_clients // 2  # Half clients with a lower learning rate
+        fit_configurations = []
         standard_config = {"lr": 0.001}
         higher_lr_config = {"lr": 0.003}
-        fit_configurations = []
+        half_clients = len(clients) // 2
 
-        # Assign learning rates based on client index
         for idx, client in enumerate(clients):
             if idx < half_clients:
                 fit_configurations.append((client, FitIns(parameters, standard_config)))
             else:
-                fit_configurations.append(
-                    (client, FitIns(parameters, higher_lr_config))
-                )
+                fit_configurations.append((client, FitIns(parameters, higher_lr_config)))
 
-        return fit_configurations  # Return configured clients for training
+        end_time = time.time()
+        timed_time = round(end_time - start_time, 4)
+        print(f"Training config took {timed_time} sec.")
+        log_time("Config_fit", timed_time)
+
+        return fit_configurations
 
     def aggregate_fit(
             self,
@@ -222,130 +289,126 @@ class FedCustom(Strategy):
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         """Aggregate fit results using weighted average and handle missing metrics."""
 
-        # Extract model updates (parameters) and the number of examples from each client
-        client_updates = [
-            (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
-            for _, fit_res in results
-        ]
+        print(f"Aggregating results for round {server_round}")
 
-        # Number of layers from the first client
-        num_layers = len(client_updates[0][0])
+        # Timing the start of the aggregation fitting process
+        start_time = time.time()
 
-        # Check consistency for each layer across clients
-        for layer_idx in range(num_layers):
-            # Collect the shapes of the current layer from all clients
-            layer_shapes = [params[layer_idx].shape for params, _ in client_updates]
+        if not results:
+            print("No results received from clients. Skipping aggregation.")
+            return None, {}
 
-            # Get unique shapes and count occurrences
-            unique_shapes = set(layer_shapes)
+        # Extract model updates (parameters) and number of examples from each client
+        client_weights = []
+        num_examples = []
+        client_metadata = []
+        random_client = random.choice(results)  # Choosing random client for request of data used
+        rnd_client_id = random_client[0].cid
+        if rnd_client_id not in self.data_usage_clients:
+            self.data_usage_clients.append(rnd_client_id)
 
-            # Raise an error if there are inconsistencies
-            if len(unique_shapes) != 1:
-                inconsistent_clients = [i for i, shape in enumerate(layer_shapes) if shape != layer_shapes[0]]
-                raise ValueError(
-                    f"Inconsistent shapes detected for layer {layer_idx}: {unique_shapes}. "
-                    f"Inconsistent client indices: {inconsistent_clients}. Each client should have "
-                    f"matching layer shapes for aggregation."
-                )
-            else:
-                print(f"Layer {layer_idx} shapes are consistent across clients: {unique_shapes}")
+        for client, fit_res in results:
+            if fit_res.parameters is not None:
+                try:
+                    # Convert Flower Parameters object to NumPy arrays
+                    client_weights.append(parameters_to_ndarrays(fit_res.parameters))
+                    num_examples.append(fit_res.num_examples)
 
-        # Perform aggregation layer by layer
-        aggregated_params = []
-        for layer_idx in range(num_layers):
-            # Gather weights and number of examples per client for the current layer
-            layer_weights = np.array([params[layer_idx] for params, _ in client_updates])
-            num_examples = np.array([num for _, num in client_updates])
+                    # Prepare metadata for each client
+                    client_metadata.append({
+                        "client_id": client.cid,
+                        "epoch": server_round,
+                        "weights_hash": str(hash(str(fit_res.parameters))),
+                    })
 
-            # Ensure num_examples is a 1D array for weighted averaging
-            if num_examples.ndim != 1:
-                num_examples = num_examples.flatten()
+                except Exception as e:
+                    print(f"⚠Failed to convert parameters from client {client.cid}: {e}")
 
-            # Weighted average of the layer weights
-            weighted_avg = np.average(layer_weights, axis=0, weights=num_examples)
+        # Check if we actually received valid updates
+        if not client_weights:
+            print("No valid client updates received. Skipping aggregation.")
+            return None, {}
 
-            # Convert to array if it's a scalar to maintain consistency
-            if np.isscalar(weighted_avg):
-                weighted_avg = np.array([weighted_avg])
+        print(f"{len(client_weights)} clients provided valid updates.")
 
-            aggregated_params.append(weighted_avg)
-
-        # Log types of aggregated_params to ensure they're arrays or lists before sending
-        # print(f"Aggregated parameter types: {[type(param) for param in aggregated_params]}")
-
-        # Serialize and encrypt aggregated weights
-        # print("Length of aggregated parameters is: ", len(aggregated_params))
-        serialized_params = self.serialize_parameters(aggregated_params)
-        # print("Length of serialized parameters is: ", len(serialized_params))
-        encrypted_params = encrypt_with_rsa(serialized_params)
-
-        # print(f"Aggregated parameter types: {[type(param) for param in aggregated_params]}")
-
-        # Send encrypted aggregated weights to the remote server
         try:
-            # print("Sending aggregated weights to the remote API server...")
-            aggregated_params_from_server = send_weights_to_server(encrypted_params)
-            # print(f"Raw response content (first 100 bytes): {aggregated_params_from_server[:100]}")
-            # print(f"Response type: {type(aggregated_params_from_server)}, Length: {len(aggregated_params_from_server)}")
-            if aggregated_params_from_server is None:
-                raise ValueError("Failed to receive aggregated weights from the remote server.")
-            print("Aggregated weights successfully sent and returned from the remote server.")
+            print("Sending client weights to server for aggregation...")
+            # Serialize and send client weights and number of examples to the server for aggregation
+            aggregated_weights = send_weights_to_server(client_weights, num_examples, client_metadata)
 
-            # Decrypt weights to simulate the return from the server
-            # print("Before decryption")
-            decrypted_params = decrypt_with_rsa(aggregated_params_from_server)
-            # print("Length of decrypted parameters from server is: ", len(decrypted_params))
-            # print("After decryption and before deserializing")
-            final_params = self.deserialize_parameters(decrypted_params)
-            print("Encrypted aggregated weights successfully sent and decrypted from the server")
+            if aggregated_weights is None:
+                raise ValueError("Failed to receive aggregated weights from the server.")
+
+            # Deserialize the aggregated weights (if needed)
+            final_params = self.deserialize_parameters(aggregated_weights)
+
         except Exception as e:
             print(f"Error while sending to remote server: {e}")
             return None, {}
 
-        # Convert the aggregated weights back to Flower Parameters format
+        # Convert aggregated parameters back to Flower Parameters format
         parameters_aggregated = ndarrays_to_parameters(final_params)
 
-        # Tracking training loss and accuracy from clients
+        # Calculate aggregated loss and accuracy
         total_examples = sum(fit_res.num_examples for _, fit_res in results)
-        weighted_loss = 0.0
-        weighted_accuracy = 0.0
+        weighted_loss = sum(
+            fit_res.num_examples * fit_res.metrics.get("loss", 0.0) for _, fit_res in results) / total_examples
+        weighted_accuracy = sum(
+            fit_res.num_examples * fit_res.metrics.get("accuracy", 0.0) for _, fit_res in results) / total_examples
 
-        # Aggregate losses and accuracies
-        for _, fit_res in results:
-            # Get loss and accuracy from client results
-            loss = fit_res.metrics.get("loss", 0.0)  # Default to 0.0 if not provided
-            accuracy = fit_res.metrics.get("accuracy", 0.0)  # Default to 0.0 if not provided
+        print(f"Aggregated Metrics - Loss: {weighted_loss:.4f}, Accuracy: {weighted_accuracy:.4f}")
 
-            # Weight metrics by the number of examples for each client
-            weighted_loss += fit_res.num_examples * loss
-            weighted_accuracy += fit_res.num_examples * accuracy
-
-        # Final weighted average
-        if total_examples > 0:
-            weighted_loss /= total_examples
-            weighted_accuracy /= total_examples
-        else:
-            weighted_loss = 0.0
-            weighted_accuracy = 0.0
-
-        # Log final metrics
-        print(f"Round {server_round} - Weighted Training Loss: {weighted_loss}")
-        print(f"Round {server_round} - Weighted Training Accuracy: {weighted_accuracy}")
+        timer1 = time.time()  # Timing the aggregation
 
         # Save to history
         self.history.add_loss_centralized(server_round, weighted_loss)
         self.history.add_metrics_distributed_fit(server_round, {"accuracy": weighted_accuracy})
 
-        metrics_aggregated = {"loss": weighted_loss, "accuracy": weighted_accuracy}
+        timer2 = time.time()  # Timing the history saving process
 
-        # Update the global model with the aggregated weights
-        param_arrays = parameters_to_ndarrays(parameters_aggregated)
-        self.model.set_weights(param_arrays)
+        # Update the global model
+        self.model.set_weights(parameters_to_ndarrays(parameters_aggregated))
 
-        # Save the model after each round
+        timer3 = time.time()  # Timing the global mode updating
+
+        # Save the aggregated model
         self.save_model(server_round)
 
-        return parameters_aggregated, metrics_aggregated
+        timer4 = time.time()  # Timing the end of the process + model saving
+
+        full_process_time = round(timer4 - start_time, 4)
+        agg_fit_time = round(timer1 - start_time, 4)
+        history_time = round(timer2 - timer1, 4)
+        glob_model_time = round(timer3 - timer2, 4)
+        model_save_time = round(timer4 - timer3, 4)
+
+        print(f"Times for different actions measured -> Full process ended in {full_process_time} sec,"
+              f"\nAggregation fitting ended in {agg_fit_time} sec,\nHistory saving lasted {history_time} sec,"
+              f"\nGlobal model updating lasted {glob_model_time} sec,\nModel saving lasted {model_save_time} sec.")
+        log_time("Model_save", model_save_time)
+        log_time("Glob_model_upd", glob_model_time)
+        log_time("History_save", history_time)
+        log_time("Agg_fit", agg_fit_time)
+        log_time("Agg_fit_full", full_process_time)
+
+        if server_round == 3:
+            data_usage = request_data_usage_from_agg_server(self.data_usage_clients)
+
+            #print(data_usage)
+            print("\nData Usage Information:")
+            print("-" * 50)
+            print(f"{'Client ID':<25} {'Epoch':<10} {'Weights Hash':<25}")
+            print("-" * 50)
+
+            for entry in data_usage:
+                client_id = entry['client_id']
+                epoch = entry['epoch']
+                weights_hash = entry['weights_hash']
+                print(f"{client_id:<25} {epoch:<10} {weights_hash:<25}")
+
+            print("-" * 50)
+
+        return parameters_aggregated, {"loss": weighted_loss, "accuracy": weighted_accuracy}
 
     def save_model(self, server_round: int):
         """Save the global model to disk after each round."""
@@ -359,19 +422,22 @@ class FedCustom(Strategy):
         """Configure the next round of evaluation."""
         if self.fraction_evaluate == 0.0:
             return []
-        config = {}
-        evaluate_ins = EvaluateIns(parameters, config)
+
+        # Convert Parameters object to NumPy arrays
+        param_arrays = parameters_to_ndarrays(parameters)
 
         # Sample clients for evaluation
-        sample_size, min_num_clients = self.num_evaluation_clients(
-            client_manager.num_available()
-        )
-        clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
-        )
+        sample_size, min_num_clients = self.num_evaluation_clients(client_manager.num_available())
+        clients = client_manager.sample(num_clients=sample_size, min_num_clients=min_num_clients)
 
-        # Return client/config pairs for evaluation
-        return [(client, evaluate_ins) for client in clients]
+        evaluate_configurations = []
+
+        for client in clients:
+            # Create evaluation instructions with unencrypted parameters
+            evaluate_ins = EvaluateIns(parameters, {})
+            evaluate_configurations.append((client, evaluate_ins))
+
+        return evaluate_configurations
 
     def aggregate_evaluate(
             self,
@@ -437,4 +503,3 @@ class FedCustom(Strategy):
         """Return sample size and required number of clients for evaluation."""
         num_clients = int(num_available_clients * self.fraction_evaluate)
         return max(num_clients, self.min_evaluate_clients), self.min_available_clients
-

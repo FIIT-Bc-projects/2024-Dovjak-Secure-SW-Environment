@@ -1,13 +1,15 @@
-import base64
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import numpy as np
-from config_crypto import encryption_key
-from Crypto.Cipher import PKCS1_OAEP
-from Crypto.Cipher import AES
+import datetime
+from pymongo import MongoClient
 from Crypto.PublicKey import RSA
 
+# Set up MongoDB connection
+client = MongoClient("mongodb://localhost:27017/")  # MongoDB URI (default: localhost:27017)
+db = client.aggregation_db  # Select or create a database
+metadata_collection = db.metadata  # Select or create a collection
 
 # Load RSA keys
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,72 +25,80 @@ with open(public_key_path, "rb") as pub_file:
     public_key = RSA.import_key(pub_file.read())
 
 
-# RSA encryption function
-def encrypt_data_with_rsa(data):
-    """Encrypt data using RSA hybrid encryption."""
-    # Generate a random symmetric key for AES encryption
-    symmetric_key = os.urandom(16)
-
-    # Encrypt the data using AES
-    aes_cipher = AES.new(symmetric_key, AES.MODE_EAX)
-    ciphertext, tag = aes_cipher.encrypt_and_digest(data)
-    encrypted_data = aes_cipher.nonce + ciphertext + tag
-
-    # Encrypt the symmetric key using RSA
-    rsa_cipher = PKCS1_OAEP.new(public_key)
-    encrypted_key = rsa_cipher.encrypt(symmetric_key)
-
-    # Combine the encrypted symmetric key and encrypted data
-    return encrypted_key + encrypted_data
-
-
-# RSA decryption function
-def decrypt_data_with_rsa(encrypted_message):
-    """Decrypt data using RSA hybrid encryption."""
-    encrypted_key = encrypted_message[:256]  # First 256 bytes
-    encrypted_data = encrypted_message[256:]  # Remaining bytes
-
-    # Decrypt the symmetric key using RSA
-    rsa_cipher = PKCS1_OAEP.new(private_key)
-    symmetric_key = rsa_cipher.decrypt(encrypted_key)
-
-    # Decrypt the weights with AES
-    aes_cipher = AES.new(symmetric_key, AES.MODE_EAX, nonce=encrypted_data[:16])
-    plaintext = aes_cipher.decrypt_and_verify(encrypted_data[16:-16], encrypted_data[-16:])
-    return plaintext
-
-
 # Decode weights function
 def decode_weights(encrypted_data):
     """Decrypt received data and deserialize weights."""
-    # print(f"Server Received Encrypted Data Length: {len(encrypted_data)}")
-    decrypted_data = decrypt_data_with_rsa(encrypted_data)
-    # print("Server sided decryption of data length is: ", len(decrypted_data))
-    weights = [np.array(w) for w in json.loads(decrypted_data.decode('utf-8'))]
-    return weights
+    decrypted_data = encrypted_data  # HELP for debug
+
+    try:
+        weights_data = json.loads(decrypted_data.decode("utf-8"))
+
+        return weights_data
+    except Exception as e:
+        print(f"Error decoding weights: {e}")
+        return []
 
 
 class AggregationHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
+        if self.path == '/aggregation':
+            # Handle aggregation-related POST request
+            self.handle_aggregation_request()
+        elif self.path == '/data-usage':
+            # Handle data usage verification request
+            self.handle_data_usage_request()
+        else:
+            self.send_error(404, "Not Found")
+
+    def handle_aggregation_request(self):
         try:
             print("Received POST request")
+
+            # Extract metadata from the custom header
+            metadata_header = self.headers.get("Client-Metadata", "[]")
+            metadata = json.loads(metadata_header)  # Parse the JSON string into a list of dictionaries
+
+            # Process each client_id and epoch pair
+            full_examples = []
+            all_clients = []
+            all_epochs = []
+            all_hashs = []
+            for entry in metadata:
+                client_id = entry.get("client_id", "unknown_client")
+                epoch = entry.get("epoch", 0)
+                num_examples = entry.get("num_examples", 0)
+                weight_hash = entry.get("weights_hash", 0)
+                full_examples.append(num_examples)
+                all_epochs.append(epoch)
+                all_clients.append(client_id)
+                all_hashs.append(weight_hash)
+
+                # Insert metadata into MongoDB
+                metadata_document = {
+                    "client_id": client_id,
+                    "epoch": epoch,
+                    "num_examples": num_examples,
+                    "weights_hash": weight_hash,
+                    "timestamp": datetime.datetime.now()  # Add timestamp for reference
+                }
+
+                # Insert the document into the 'metadata' collection
+                metadata_collection.insert_one(metadata_document)
+
+                print(f"Inserted metadata for client {client_id} into MongoDB.")
+
+            # Read the binary weights from the body
             content_length = int(self.headers['Content-Length'])
-            print(f"Content-Length: {content_length}")
-            encrypted_data = self.rfile.read(content_length)
-            # print("Data received:", encrypted_data[:100])  # Print first 100 bytes
-            # print("Length of data is: ", len(encrypted_data))
-            client_weights = decode_weights(encrypted_data)
-            # print(f"Received weights with shapes: {[w.shape for w in client_weights]}")
+            post_data = self.rfile.read(content_length)
+
+            client_weights = decode_weights(post_data)
 
             # Aggregate and prepare response
-            aggregated_weights = self.aggregate_weights(client_weights)
+            aggregated_weights = self.aggregate_weights(client_weights, full_examples)
+
             serialized_response = json.dumps([w.tolist() for w in aggregated_weights]).encode('utf-8')
-            # print("Length of serialized response is: ", len(serialized_response))
-            encrypted_response = encrypt_data_with_rsa(serialized_response)
-            # print("Length of encrypted serialized response is: ", len(encrypted_response))
-            # print(f"Response being sent (first 100 bytes): {encrypted_response[:100]}")
-            # print(f"Total length of encrypted response: {len(encrypted_response)}")
+            encrypted_response = serialized_response  # help for decoding
 
             # Send encrypted response to client as bytes
             self.send_response(200)
@@ -107,45 +117,73 @@ class AggregationHandler(BaseHTTPRequestHandler):
 
             self.send_error(500, "Server error.")
 
-    def check_consistent_shapes(self, client_weights):
-        # Ensure that the shapes of client weights are consistent.
-        # Group client weights by layer index and ensure consistency
-        num_layers = len(client_weights)
-        for layer_idx in range(num_layers):
-            # Extract the shapes of the current layer's weights from all clients
-            layer_shape = client_weights[layer_idx].shape
-            # print(f"Checking consistency for layer {layer_idx}, shape: {layer_shape}")
-            if layer_shape != client_weights[layer_idx].shape:
-                raise ValueError(f"Inconsistent shapes detected for layer {layer_idx}: {layer_shape}")
+    def handle_data_usage_request(self):
+        """Handle POST request for data usage verification."""
+        try:
+            print("Received POST request for data usage verification")
 
-    def aggregate_weights(self, client_weights):
+            # Parse the incoming JSON payload (client_ids)
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            request_data = json.loads(post_data.decode("utf-8"))
+            client_ids = request_data.get("client_ids", [])
+
+            # Query MongoDB for the metadata of the specified client IDs
+            metadata = self.query_metadata(client_ids)
+
+            # Send the queried metadata as a response
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(metadata).encode('utf-8'))  # Send JSON response
+
+        except Exception as e:
+            print(f"[Server Error] Error handling data usage POST request: {e}")
+            self.send_error(500, "Server error.")
+
+    def query_metadata(self, client_ids):
+        """Query MongoDB for metadata related to the provided client IDs."""
+        metadata = []
+        for client_id in client_ids:
+            client_data = metadata_collection.find({"client_id": client_id})
+            for entry in client_data:
+                metadata.append({
+                    "client_id": entry["client_id"],
+                    "epoch": entry["epoch"],
+                    "weights_hash": entry["weights_hash"],  # Return the weights data like hash used in that epoch
+                })
+        return metadata
+
+    def aggregate_weights(self, client_weights, num_examples):
         
         # Aggregate weights layer-by-layer.
-        # Assumes client_weights is a list of model weights from different clients,
+        # client_weights is a list of model weights from different clients,
         # where each element in the list is a set of layer weights for a particular client.
         
         try:
-            # Number of layers (assumes each client has the same number of layers)
-            num_layers = len(client_weights)
+            # Step 2: Aggregate the client weights using a weighted average
+            total_examples = sum(num_examples)
+            num_layers = len(client_weights[0])  # Assuming each client has the same model structure
+            # Initialize a list to hold the aggregated weights
+            aggregated_weights = [np.zeros_like(client_weights[0][layer_idx]) for layer_idx in range(num_layers)]
 
-            aggregated_weights = []
-            print("Before aggregation in api server")
-            # Aggregate weights for each layer
+            # Perform layer-wise aggregation
             for layer_idx in range(num_layers):
-                # Extract the weights for this layer from all clients
-                layer_weights = np.array([client_weights[layer_idx]])
-
-                # Log the shapes of the layer weights being aggregated
-                #print(f"Aggregating layer {layer_idx}, weight shapes: {[w.shape for w in layer_weights]}")
-
-                # Perform weighted average (or simple average in this case)
-                layer_aggregated = np.mean(layer_weights, axis=0)
-
-                # Append aggregated layer weights
-                aggregated_weights.append(layer_aggregated)
-            print("After aggregation in api server")
+                weighted_sum = np.zeros_like(
+                    client_weights[0][layer_idx])  # Initialize weighted sum with the first client's layer shape
+                # Sum the weighted client weights for each layer
+                count = 0
+                for weights, num_example in zip(client_weights, num_examples):
+                    if isinstance(weights[layer_idx], np.ndarray):
+                        weighted_sum += weights[
+                                        layer_idx] * num_example  # Multiply weights by the client's number of examples
+                    else:
+                        # If weights are not NumPy arrays, convert them
+                        weighted_sum += np.array(weights[layer_idx]) * num_example
+                    count += 1
+                # Normalize by the total number of examples (weighted average)
+                aggregated_weights[layer_idx] = weighted_sum / total_examples
             return aggregated_weights
-
         except Exception as e:
             # Log the error
             print(f"Error handling POST request: {e}")
